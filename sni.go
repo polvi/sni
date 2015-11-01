@@ -2,17 +2,20 @@ package sni
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
+	"io"
 	"net"
 )
 
 type bufferedConn struct {
-	r *bufio.Reader
+	r    *bufio.Reader
+	rout io.Reader
 	net.Conn
 }
 
 func newBufferedConn(c net.Conn) bufferedConn {
-	return bufferedConn{bufio.NewReader(c), c}
+	return bufferedConn{bufio.NewReader(c), nil, c}
 }
 
 func (b bufferedConn) Peek(n int) ([]byte, error) {
@@ -20,28 +23,14 @@ func (b bufferedConn) Peek(n int) ([]byte, error) {
 }
 
 func (b bufferedConn) Read(p []byte) (int, error) {
+	if b.rout != nil {
+		return b.rout.Read(p)
+	}
 	return b.r.Read(p)
 }
 
-func getServername(c bufferedConn) (string, error) {
-	b, err := c.Peek(5)
-	if err != nil {
-		return "", err
-	}
-
-	if b[0] != 0x16 {
-		return "", errors.New("not TLS")
-	}
-
-	restLengthBytes := b[3:]
-	restLength := (int(restLengthBytes[0]) << 8) + int(restLengthBytes[1])
-
-	all, err := c.Peek(5 + restLength)
-	if err != nil {
-		return "", err
-	}
-
-	rest := all[5:]
+func getHello(b []byte) (string, error) {
+	rest := b[5:]
 	current := 0
 	handshakeType := rest[0]
 	current += 1
@@ -68,16 +57,14 @@ func getServername(c bufferedConn) (string, error) {
 	current += 1
 	current += compressionMethodLength
 
-	if current > restLength {
+	if current > len(rest) {
 		return "", errors.New("no extensions")
 	}
 
-	// Skip over extensionsLength
-	// extensionsLength := (int(rest[current]) << 8) + int(rest[current + 1])
 	current += 2
 
 	hostname := ""
-	for current < restLength && hostname == "" {
+	for current < len(rest) && hostname == "" {
 		extensionType := (int(rest[current]) << 8) + int(rest[current+1])
 		current += 2
 
@@ -105,14 +92,46 @@ func getServername(c bufferedConn) (string, error) {
 		return "", errors.New("No hostname")
 	}
 	return hostname, nil
+
+}
+
+func getHelloBytes(c bufferedConn) ([]byte, error) {
+	b, err := c.Peek(5)
+	if err != nil {
+		return []byte{}, err
+	}
+
+	if b[0] != 0x16 {
+		return []byte{}, errors.New("not TLS")
+	}
+
+	restLengthBytes := b[3:]
+	restLength := (int(restLengthBytes[0]) << 8) + int(restLengthBytes[1])
+
+	return c.Peek(5 + restLength)
+
+}
+
+func getServername(c bufferedConn) (string, []byte, error) {
+	all, err := getHelloBytes(c)
+	if err != nil {
+		return "", nil, err
+	}
+	name, err := getHello(all)
+	if err != nil {
+		return "", nil, err
+	}
+	return name, all, err
+
 }
 
 // Uses SNI to get the name of the server from the connection. Returns the ServerName and a buffered connection that will not have been read off of.
 func ServerNameFromConn(c net.Conn) (string, net.Conn, error) {
 	bufconn := newBufferedConn(c)
-	sn, err := getServername(bufconn)
+	sn, helloBytes, err := getServername(bufconn)
 	if err != nil {
 		return "", nil, err
 	}
+	bufconn.rout = io.MultiReader(bytes.NewBuffer(helloBytes), c)
 	return sn, bufconn, nil
 }
